@@ -361,14 +361,14 @@ every allocated node; home directories are often not shared.
 .. code-block:: bash
 
    #!/bin/bash
-   #SBATCH -J mpi-demo
+   #SBATCH -J hello-mpi
    #SBATCH -N 2
    #SBATCH --ntasks-per-node=4
    #SBATCH -t 01:00:00
    #SBATCH --mpi=pmix
 
    cd "$SLURM_SUBMIT_DIR"
-   srun --mpi=pmix ./a.out
+   srun --mpi=pmix ./hello_mpi
 
 Use ``--mpi=pmix`` on both the batch header and the inner ``srun``. After
 ``sbatch``, ``spur-<jobid>.out`` may appear on an allocated node rather than

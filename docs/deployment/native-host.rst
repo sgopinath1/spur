@@ -356,8 +356,6 @@ For production, run the agent as a systemd service:
    User=root
    LimitMEMLOCK=infinity
    LimitNOFILE=65536
-   Environment=PMIX_MCA_gds=hash
-   Environment=PMIX_MCA_psec=none
 
    [Install]
    WantedBy=multi-user.target
@@ -388,11 +386,11 @@ The default can be changed in ``spur.conf``:
 
 .. note::
 
-   With the default ``"unlimited"`` setting, ``spurd`` raises memlock while it is
-   still privileged. That requires a **root** (or otherwise CAP_SYS_RESOURCE)
-   agent. Unprivileged ``spurd`` cannot raise the limit; add
-   ``LimitMEMLOCK=infinity`` only helps if the unit itself is privileged. See
-   MPI (PMIx) below.
+   With the default ``"unlimited"`` setting, a **root** ``spurd`` raises memlock
+   itself while still privileged, so ``LimitMEMLOCK`` on the unit is optional.
+   An unprivileged agent cannot raise the hard limit. Set
+   ``LimitMEMLOCK=infinity`` on the systemd unit in that case: systemd applies
+   it before dropping to ``User=``. See MPI (PMIx) below.
 
 CPU and Memory Limits (cgroups)
 -------------------------------
@@ -561,14 +559,16 @@ plugin in ``/opt/spur/lib/spur``. Copying the plugin to one path while leaving
 
 Create the PMIx scratch dir on every agent: ``sudo mkdir -p /tmp/spur-pmix && sudo chmod 1777 /tmp/spur-pmix``.
 
-**``spurd`` for MPI.** Run the agent as **root** with ``LimitMEMLOCK=infinity``.
-``[rlimits] memlock`` only raises the limit while ``spurd`` is still privileged.
-An unprivileged agent (for example ``User=ubuntu``) leaves ranks with a small
-hard memlock (often 8 MiB); UCX then spins in ``ibv_reg_mr`` and ``MPI_Init``
-never finishes. Register ``--address`` with a hostname/IP **other nodes can
-reach** (not a name that resolves to ``127.0.0.1``, and not an internal
-``hostname -f`` if peers use a different FQDN). Set hash GDS on the **server**
-(``spurd`` environment) as well as in rank ``env.sh`` (see below).
+**``spurd`` for MPI.** Prefer a root agent. ``[rlimits] memlock`` only raises
+the limit while ``spurd`` is still privileged. For an unprivileged agent
+(a systemd ``User=`` other than root), set ``LimitMEMLOCK=infinity`` on the
+unit so systemd raises the hard limit before dropping privileges. Without
+root or that unit limit, ranks often keep a small hard memlock (often 8 MiB);
+UCX then spins in ``ibv_reg_mr`` and ``MPI_Init`` never finishes. Register
+``--address`` with a hostname/IP **other nodes can reach** (not a name that
+resolves to ``127.0.0.1``, and not an internal name if peers use a different
+FQDN). On Ubuntu ``libpmix2t64``, set hash GDS on the **server** (``spurd``
+environment) as well as in rank ``env.sh`` (see below).
 
 .. code-block:: ini
 
@@ -576,7 +576,6 @@ reach** (not a name that resolves to ``127.0.0.1``, and not an internal
    User=root
    LimitMEMLOCK=infinity
    Environment=PMIX_MCA_gds=hash
-   Environment=PMIX_MCA_psec=none
 
 **Start or restart daemons** after install or upgrade (controller first, then
 agents). Example on an agent:
@@ -596,22 +595,19 @@ are often not shared. Ubuntu ``libpmix2t64`` needs **hash GDS** on both
 ``spurd`` and the ranks — default shmem GDS fails against Spur's PMIx server.
 
 On multi-NIC hosts, pin Open MPI TCP to the IPv4 interface that reaches peer
-agents. Unpinned ``btl=tcp`` will try docker/flannel/Calico/IPv6-only NICs;
-**4 tasks/node × 2 nodes** then hangs in ``MPI_Init`` even though 1 task/node
-or a single node may succeed.
+agents (``ip -br addr``). Unpinned ``btl=tcp`` may pick docker, overlay, or
+IPv6-only NICs; **several tasks per node across two nodes** then hangs in
+``MPI_Init`` even though a single-node or 1-task-per-node run may succeed.
 
 .. code-block:: bash
 
    mkdir -p "$HOME/spur/mpi"
    cat > "$HOME/spur/mpi/env.sh" <<'EOF'
-   export PMIX_MCA_gds=hash
-   export PMIX_MCA_psec=none
-   export OPAL_PREFIX=/usr/mpi/gcc/openmpi-4.1.7rc1   # your Open MPI prefix
+   export PMIX_MCA_gds=hash                          # Ubuntu libpmix2t64; omit if GDS already works
+   export OPAL_PREFIX=/opt/openmpi                  # prefix used to build the application
    export LD_LIBRARY_PATH="${OPAL_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-   export OMPI_MCA_pml=ob1
-   export OMPI_MCA_btl=vader,tcp,self
-   export OMPI_MCA_btl_tcp_if_include=ens3            # Crusoe M2M: ens3; use your fabric NIC
-   export OMPI_MCA_oob_tcp_if_include=ens3
+   export OMPI_MCA_btl_tcp_if_include=eth0           # fabric NIC that reaches peer agents
+   export OMPI_MCA_oob_tcp_if_include=eth0
    EOF
 
 Build the application **on each agent** with that prefix's ``mpicc`` (the
@@ -619,7 +615,7 @@ controller often has no MPI compiler). The binary path in the batch script
 must exist on every allocated node.
 
 **Verify MPI wiring** from a host with CLI access **after** ``env.sh`` and
-``a.out`` are in place:
+the MPI binary are in place:
 
 .. code-block:: bash
 
@@ -630,7 +626,7 @@ must exist on every allocated node.
    srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # 4 ranks total (2 per node)
    # Stronger multi-node check (same layout as a typical sbatch):
    # srun --mpi=pmix -N2 -n8 /path/to/hello_mpi
-   # or: sbatch with -N 2 --ntasks-per-node=4 --mpi=pmix then srun --mpi=pmix ./a.out
+   # or: sbatch with -N 2 --ntasks-per-node=4 --mpi=pmix then srun --mpi=pmix ./hello_mpi
 
 Multi-node ``--mpi=pmix`` requires a **uniform task layout**: ``-n`` must be
 evenly divisible by ``-N`` (same number of tasks on every node). For example,
@@ -773,18 +769,18 @@ Typical batch script (binary must exist at this path on **every** allocated node
 .. code-block:: bash
 
    #!/bin/bash
-   #SBATCH -J mpi-demo
+   #SBATCH -J hello-mpi
    #SBATCH -N 2
    #SBATCH --ntasks-per-node=4
    #SBATCH -t 01:00:00
    #SBATCH --mpi=pmix
 
    cd "$SLURM_SUBMIT_DIR"
-   srun --mpi=pmix ./a.out
+   srun --mpi=pmix ./hello_mpi
 
-``sbatch mpi-demo.sh`` from a host with ``PATH`` and ``SPUR_CONTROLLER_ADDR``
-set. Look for ``spur-<jobid>.out`` on an allocated agent if homes are not
-shared. Expect eight ``rank=… size=8`` lines.
+Submit from a host with ``PATH`` and ``SPUR_CONTROLLER_ADDR`` set. Look for
+``spur-<jobid>.out`` on an allocated agent if homes are not shared. Expect
+eight ``rank=… size=8`` lines.
 
 Inside an interactive allocation (``salloc``), enable PMIx per step:
 
@@ -846,7 +842,8 @@ Operational notes
   not the submission host, when those filesystems are not shared.
 - A job may sit in ``COMPLETING`` after ranks have already printed and
   ``ExitCode=0:0``. Check the ``.out`` file before assuming ``MPI_Init`` hung.
-  A hang looks like ~100 % CPU ``a.out`` and an empty ``.out`` until cancel.
+  A hang looks like ~100 % CPU on the rank processes and an empty ``.out``
+  until cancel.
 
 Submitting Jobs
 ---------------
